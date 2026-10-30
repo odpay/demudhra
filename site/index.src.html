@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>demudhra: remove the compromised eMudhra certs</title>
+<meta name="description" content="Eight eMudhra CAs shipped with private keys anyone can recover. Browsers block them. curl, git and python may not. One command finds and removes them, with undo.">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<link rel="canonical" href="https://demudhra.sh/">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://demudhra.sh/">
+<meta property="og:title" content="demudhra">
+<meta property="og:description" content="Your browser already blocks the compromised eMudhra certs. This removes them from the rest of your machine.">
+<meta property="og:image" content="https://demudhra.sh/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="demudhra">
+<meta name="twitter:description" content="Your browser already blocks the compromised eMudhra certs. This removes them from the rest of your machine.">
+<meta name="twitter:image" content="https://demudhra.sh/og.png">
+</head>
+<body>
+<main>
+
+<header>
+  <h1>demudhra</h1>
+  <p class="lede">Your browser already blocks the compromised eMudhra certificates. This removes them from the rest of your machine.</p>
+</header>
+
+<section class="hook">
+  <p>In October 2026, eight eMudhra intermediate CAs turned out to have P-384 private keys that were
+    <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=2083449#c5">integers smaller than 256</a>.
+    Anyone can recover them near instantly. Sectigo had cross-signed the same keys, so that's
+    <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=2083449#c2">16 certificates</a>.
+    A commenter on Mozilla's bug <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=2083449#c44">counted 107,107 certificates</a>
+    signed with six of those keys logged to CT in under two days, most of them proof-of-concepts for google.com.</p>
+  <p>Chrome, Firefox and Apple's frameworks block them now
+    (<a href="https://blog.google/security/protecting-chrome-and-android-users-from-compromised-emudhra-intermediate-ca-certificates/">Google</a>,
+    <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=2083449">Mozilla</a>,
+    <a href="https://support.apple.com/en-us/149555">Apple</a>).
+    But curl, git, python3 and anything else that reads its own CA file
+    <a href="https://support.apple.com/en-us/149555">can still accept them</a>.
+    This finds them by fingerprint and removes them.</p>
+</section>
+
+<div class="cmd">
+  <code id="command">curl -fsSL https://demudhra.sh/run | sh</code>
+  <button id="copy" type="button" hidden>copy</button>
+</div>
+<p class="under">Linux and macOS. Scans, shows what it found, then asks. <span id="copy-status" role="status"></span></p>
+
+<figure class="term">
+<pre>{{TRANSCRIPT}}</pre>
+<figcaption>A real run against a test Debian filesystem, trimmed to fit. <code>...</code> marks skipped lines.</figcaption>
+</figure>
+
+<section>
+  <h2>What it checks</h2>
+  <dl class="spec">
+    <dt>OS store</dt>
+    <dd>Debian, Ubuntu, Fedora, RHEL, Arch, Alpine, SUSE and their relatives. Rebuilt with the distro's own tool, and blocked so a package update can't put the root back.</dd>
+    <dt>macOS</dt>
+    <dd><code>/etc/ssl/cert.pem</code>, the file <a href="https://support.apple.com/en-us/149555">Apple's note</a> tells admins to edit, which curl, git, python3, ruby and openssl read.
+      It drops each cert with its <code>===</code> header line, then re-reads the file to check. A macOS update can put it back, so run it again after updating.
+      Also the system and login keychains, plus Xcode tools, Homebrew, MacPorts and app bundles in <code>/Applications</code>.</dd>
+    <dt>Bundles</dt>
+    <dd>Java <code>cacerts</code> (every <code>java</code> on PATH, <code>JAVA_HOME</code>, SDKMAN, Gradle and IDE JDKs), Python certifi in venvs, pyenv, pipx, uv and conda,
+      NSS databases for Firefox and Chrome, Node and Ruby bundles, gcloud, AWS and Azure CLIs, editor extensions, and stray curl and OpenSSL PEM files.</dd>
+    <dt>Your config</dt>
+    <dd>CA files you point at yourself: <code>SSL_CERT_FILE</code>, <code>SSL_CERT_DIR</code>, <code>REQUESTS_CA_BUNDLE</code>, <code>NODE_EXTRA_CA_CERTS</code> and friends,
+      git's <code>http.sslCAInfo</code>, <code>.npmrc</code>, <code>pip.conf</code>, <code>.curlrc</code> and <code>.wgetrc</code>. Read as plain text, never executed.</dd>
+  </dl>
+</section>
+
+<section>
+  <h2>What it can't fix</h2>
+  <dl class="spec">
+    <dt>Built-in roots</dt>
+    <dd>Node, Deno, Bun and Rust programs can carry roots compiled into the binary. It lists the ones it finds with their versions. Update those. Go uses the system store, which demudhra cleans, unless a binary embeds its own roots.</dd>
+    <dt>Containers</dt>
+    <dd>Images and snaps keep their own copies. Rebuild from updated base images, or wait for the publisher.</dd>
+    <dt>Running apps</dt>
+    <dd>Anything already running keeps the trust it loaded. Restart it.</dd>
+  </dl>
+</section>
+
+<section>
+  <h2>Undo</h2>
+  <p>Everything it changes is backed up first, and the run prints the exact command to put it back:</p>
+  <pre class="line">sh ~/demudhra-backups/demudhra-&lt;time&gt;/undo.sh</pre>
+</section>
+
+<section>
+  <h2>Flags</h2>
+  <dl class="flags">
+    <dt><code>--dry-run</code></dt><dd>report only, never ask</dd>
+    <dt><code>--yes</code></dt><dd>skip the question</dd>
+    <dt><code>--all-emudhra</code></dt><dd>{{N_ALL}} instead of {{N_DEFAULT}}: adds the {{N_MORE}} other eMudhra roots and cross-certs, G1 included</dd>
+    <dt><code>--include-aaa</code></dt><dd>one more: Sectigo's AAA Certificate Services, which
+      <a href="https://support.apple.com/en-us/149555">Apple lists as optional</a>. Other Sectigo chains can break.</dd>
+  </dl>
+  <p class="pass">Flags go after <code>sh -s --</code>:</p>
+  <pre class="line">curl -fsSL https://demudhra.sh/run | sh -s -- --dry-run</pre>
+  <p class="after">The default set is {{N_DEFAULT}} certificates: {{ROOT_NAME}} plus the {{N_INTERMEDIATE}} above.
+    <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=2083449#c18">Mozilla</a>,
+    <a href="https://blog.google/security/protecting-chrome-and-android-users-from-compromised-emudhra-intermediate-ca-certificates/">Chrome</a> and
+    <a href="https://support.apple.com/en-us/149555">Apple</a> have all pulled or blocked that root.
+    The full list is {{N_TOTAL}}: those {{N_DEFAULT}}, the {{N_MORE}} that <code>--all-emudhra</code> adds, and AAA.
+    Every fingerprint and its source is on <a href="/certs/">the cert list</a>.</p>
+</section>
+
+<footer>
+  <p>by <a href="https://github.com/odpay">odpay</a> · v{{VERSION}} · the site uses cookieless PostHog analytics; the script sends nothing</p>
+  <!-- repo link, add once odpay/demudhra is public:
+  <p><a href="https://github.com/odpay/demudhra">source</a></p>
+  -->
+</footer>
+
+</main>
+<script>
+  const copy = document.getElementById('copy');
+  if (navigator.clipboard && window.isSecureContext) {
+    copy.hidden = false;
+    copy.addEventListener('click', async () => {
+      const status = document.getElementById('copy-status');
+      try {
+        await navigator.clipboard.writeText(document.getElementById('command').textContent);
+        copy.textContent = 'copied';
+        status.textContent = '';
+        setTimeout(() => { copy.textContent = 'copy'; }, 1600);
+      } catch {
+        status.textContent = 'Select the command to copy it.';
+      }
+    });
+  }
+</script>
+</body>
+</html>

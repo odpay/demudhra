@@ -1,0 +1,58 @@
+name: Verify
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck openssl dash busybox libnss3-tools default-jre-headless
+      - name: Check generated artifacts, ShellCheck, and CLI suites
+        run: python3 tools/verify.py --timeout 45 --shell dash --shell sh --shell 'busybox sh' --output .build/verification
+      - name: Retain command logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification
+          path: .build/verification
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: brew install shellcheck
+      - name: Check generated artifacts
+        run: python3 -c 'import subprocess; subprocess.run(["python3", "tools/generate.py", "--check", "--verify-pems"], timeout=45, check=True)'
+      - name: ShellCheck with native macOS tools
+        run: python3 -c 'import glob, subprocess; subprocess.run(["shellcheck", "-s", "sh", *glob.glob("demudhra*.sh"), *glob.glob("src/*.sh")], timeout=45, check=True)'
+      - name: Run CLI tests with BSD tools
+        env:
+          DEMUDHRA_TEST_SHELL: sh
+        run: |
+          python3 - <<'PY'
+          import glob, subprocess
+          for suite in sorted(glob.glob('tests/test_*.py')):
+              subprocess.run(['python3', suite], timeout=45, check=True)
+          PY
+      - name: State native apply gap
+        run: echo 'Real macOS keychain apply and undo require a separate manual run. Shim tests do not prove native trust authorization or securityd behavior.'
+  distros:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [debian, ubuntu, fedora, alpine, archlinux, opensuse]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify local and packaged anchors in disposable containers
+        run: sh tests/containers/run.sh --engine docker '${{ matrix.distro }}'

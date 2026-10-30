@@ -1,0 +1,974 @@
+# shellcheck shell=sh
+# shellcheck disable=SC2034,SC2154
+version=0.1.1
+log() {
+    case $* in
+        FOUND*|Would\ remove*|WOULD\ REMOVE*)
+            [ "${apply:-0}" = 0 ] || return 0
+            [ "${verbose:-0}" = 1 ] || return 0;;
+    esac
+    printf '%s\n' "$*"
+}
+progress() { [ -t 2 ] && printf '\r\033[K%s\n' "$*" >&2; return 0; }
+match_place() {
+    [ "$apply" = 0 ] || return 0
+    printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$work/matches"
+    [ "$1" = keychain ] || printf '%s\n' "$2" >> "$work/targets"
+}
+malformed() { malformed_count=$((malformed_count + 1)); }
+
+fail() { log "FAILED: $*" >&2; failed=$((failed + 1)); }
+quote() { printf "'"; printf '%s' "$1" | sed "s/'/'\\\\''/g"; printf "'"; }
+usage() {
+    cat <<EOF
+ demudhra $version ($platform). Offline removal by DER SHA-256 only.
+ Usage: sh demudhra-$platform.sh [options]
+ Default: scan and report, then ask on /dev/tty. Only y/Y removes matches.
+ Without a terminal, report only. Nothing changes without y or --yes.
+ The list has 43 certificates: 17 default, 25 more with --all-emudhra,
+ and 1 Sectigo root that only --include-aaa selects.
+ Default set: 17 (emSign ECC Root CA - G3 + 16 intermediates/cross-signs).
+ --all-emudhra: 42 (the 17 plus 25 eMudhra roots/cross-certificates,
+ including G1 roots still trusted by Mozilla, Chrome and Apple per the
+ 2026-10-25 snapshot). This broader choice can break additional services.
+
+ --yes, -y              Back up and remove after reporting, without a question
+ --apply                Alias for --yes
+ --dry-run              Report only; never ask or change stores
+ --include-aaa          Also remove AAA Certificate Services (Sectigo), +1.
+                        Apple HT149555 describes this as an optional removal.
+ --all-emudhra          Select all 42 eMudhra certificates (17 + 25)
+ --deep                 Search broader trees without the default depth limit
+ --verbose              Show all matching paths and skipped malformed counts
+ --list                 Print selected fingerprints, groups, subjects, sources
+ --backup-dir DIR       Parent for private timestamped backups (apply only)
+ --no-system            Skip OS anchors and generated OS bundles
+ --no-java              Skip Java cacerts, jssecacerts, JKS stores
+ --no-nss               Skip Firefox/Chrome NSS databases
+ --no-python            Skip certifi, pip, virtualenv and conda bundles
+ --no-node              Skip NODE_EXTRA_CA_CERTS and node_modules bundles
+ --no-ruby              Skip Ruby bundles
+ --no-bundles           Skip other curl/OpenSSL/PEM/DER bundles
+ --no-keychains         Skip macOS keychains
+ -h, --help             Show help
+ --version              Show version
+
+ Exit codes: 0 clean or removal succeeded; 10 report-only found matches;
+ 11 declined, nothing changed; 1 usage/setup error; 2 real failure;
+ 3 matches remain requiring manual action; 4 targets require root.
+ Compiled-in roots cannot be edited. Upgrades or rebuilds are required.
+
+EOF
+}
+parse_args() {
+    apply=0 all=0 include_aaa=0 list=0 run_mode=prompt deep=0 verbose=0
+    skip_system=0 skip_java=0 skip_nss=0 skip_python=0 skip_node=0 skip_ruby=0 skip_bundles=0 skip_keychains=0
+    backup_base=${HOME:-/tmp}/demudhra-backups
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --apply|--yes|-y) [ "$run_mode" = dry ] || run_mode=yes;;
+            --dry-run) run_mode=dry;;
+            --include-aaa) include_aaa=1;;
+            --all-emudhra) all=1;;
+            --list) list=1;;
+            --deep) deep=1;;
+            --verbose) verbose=1;;
+            --backup-dir) [ "$#" -ge 2 ] && [ -n "$2" ] || { log '--backup-dir needs a directory' >&2; exit 1; }; backup_base=$2; shift;;
+            --no-system) skip_system=1;;
+            --no-java) skip_java=1;;
+            --no-nss) skip_nss=1;;
+            --no-python) skip_python=1;;
+            --no-node) skip_node=1;;
+            --no-ruby) skip_ruby=1;;
+            --no-bundles) skip_bundles=1;;
+            --no-keychains) skip_keychains=1;;
+            -h|--help) usage; exit 0;;
+            --version) log "demudhra $version"; exit 0;;
+            *) log "Unknown option: $1" >&2; usage >&2; exit 1;;
+        esac
+        shift
+    done
+}
+plain_path() {
+    case $1 in
+        *"$(printf '\t')"*|*'
+'*) return 1;;
+    esac
+    return 0
+}
+# Resolve file symlinks without following directory links during discovery.
+resolve_path() {
+    resolved=$1
+    links=0
+    while :; do
+        parent=$(CDPATH='' cd -P "${resolved%/*}" 2>/dev/null && pwd -P) || return 1
+        resolved=$parent/${resolved##*/}
+        [ -L "$resolved" ] || break
+        links=$((links + 1))
+        [ "$links" -le 40 ] || return 1
+        target=$(readlink "$resolved") || return 1
+        case $target in /*) resolved=$target;; *) resolved=$parent/$target;; esac
+    done
+    plain_path "$resolved" || return 1
+    if [ -n "$root" ]; then
+        case $resolved in "$root"/*) :;; *) return 1;; esac
+    fi
+    return 0
+}
+safe_path() { resolve_path "$1"; }
+canonical_backup_base() {
+    case $backup_base in /*) :;; *) backup_base=$PWD/$backup_base;; esac
+    plain_path "$backup_base" || return 1
+    rest=${backup_base#/}
+    canonical=/
+    while [ -n "$rest" ]; do
+        component=${rest%%/*}
+        case $rest in */*) rest=${rest#*/};; *) rest='';; esac
+        case $component in
+            ''|.) continue;;
+            ..) canonical=$(dirname "$canonical"); continue;;
+        esac
+        next=${canonical%/}/$component
+        if [ -d "$next" ]; then
+            canonical=$(CDPATH='' cd -P "$next" && pwd -P) || return 1
+        elif [ -e "$next" ] || [ -L "$next" ]; then return 1
+        else canonical=$next; fi
+    done
+    backup_base=$canonical
+}
+inside_backup() {
+    ancestor=${1%/*}
+    while [ "$ancestor" != / ]; do
+        [ ! -f "$ancestor/.demudhra-backup" ] || return 0
+        ancestor=${ancestor%/*}; [ -n "$ancestor" ] || ancestor=/
+    done
+    return 1
+}
+
+file_hash() {
+    digest=$(openssl dgst -sha256 "$1" 2>/dev/null) || return 1
+    printf '%s\n' "$digest" | awk '{h=tolower($NF); if(length(h)!=64 || h ~ /[^0-9a-f]/) exit 1; print h}'
+}
+fingerprint() {
+    openssl x509 -in "$1" -outform DER -out "$work/der" 2>"$work/openssl.err" || return 1
+    file_hash "$work/der"
+}
+selected() { grep -F -x -q "$1" "$work/selected"; }
+load_table() {
+    script_dir=$(CDPATH='' cd -P "$(dirname "$0")" && pwd -P) || exit 1
+    table=$script_dir/data/fingerprints.tsv
+    [ -r "$table" ] || table=$script_dir/fingerprints.tsv
+    # DEMUDHRA_TEST_ONLY_BEGIN
+    if [ "${DEMUDHRA_TESTING:-}" = 1 ] && [ "${DEMUDHRA_TEST_FINGERPRINTS+x}" = x ]; then
+        log '!!! WARNING: DEMUDHRA_TEST_FINGERPRINTS is active. TEST IDENTITIES, NOT THE RELEASE SET. !!!' >&2
+        table=$DEMUDHRA_TEST_FINGERPRINTS
+    fi
+    # DEMUDHRA_TEST_ONLY_END
+    [ -r "$table" ] || { log "Cannot read fingerprint list: $table" >&2; exit 1; }
+    awk -F '\t' -v all="$all" -v aaa="$include_aaa" '
+      /^#/ || /^[[:space:]]*$/ {next}
+      {h=tolower($1); if(length(h)!=64 || h ~ /[^0-9a-f]/) exit 1
+       g=$2; if(g=="") g="default-root"
+       if(g!="default-root" && g!="default-intermediate" && g!="all-emudhra-root" && g!="opt-in-cross-sign") exit 1
+       if(g ~ /^default-/ || (all && g=="all-emudhra-root") || (aaa && g=="opt-in-cross-sign")) print h "\t" g "\t" $3 "\t" $4
+      }' "$table" > "$work/table" || { log 'Invalid fingerprint table' >&2; exit 1; }
+    cut -f 1 "$work/table" > "$work/selected"
+    [ -s "$work/selected" ] || { log 'Empty selected fingerprint set' >&2; exit 1; }
+    if [ "$all" = 1 ]; then log 'Active set: ALL eMudhra (42 certificates: 17 default + 25 more; includes G1 still trusted by Mozilla/Chrome/Apple).'
+    else log 'Active set: DEFAULT (17 certificates: emSign ECC Root CA - G3 + 16 intermediates).'; fi
+    if [ "$include_aaa" = 1 ]; then log 'AAA Certificate Services selected. Apple HT149555 gives its removal as an optional step.'
+    else log 'AAA Certificate Services is retained. Apple HT149555 names it and gives an optional removal; Microsoft describes an AAA Certificate Services cross-sign.'; fi
+}
+ensure_backup() {
+    [ -n "$backup_run" ] && return 0
+    case $backup_base in /*) :;; *) backup_base=$PWD/$backup_base;; esac
+    plain_path "$backup_base" || { fail 'Backup path contains tab/newline'; return 1; }
+    mkdir -p "$backup_base" || { fail "Cannot create backup parent: $backup_base"; return 1; }
+    backup_run=$(mktemp -d "$backup_base/demudhra-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX") || { fail 'Cannot create backup directory'; return 1; }
+    printf 'demudhra backup v1\n' > "$backup_run/.demudhra-backup" || return 1
+    if ! cat > "$backup_run/undo.sh" <<'UNDO'
+#!/bin/sh
+set -eu
+restore_file() {
+    stage=$(mktemp "$(dirname "$2")/.demudhra-undo-XXXXXX")
+    if cp -p "$1" "$stage" && mv -f "$stage" "$2"; then return 0; fi
+    rm -f "$stage"
+    printf 'Undo failed; original target retained: %s\n' "$2" >&2
+    return 1
+}
+restore_tree_preflight() (
+    source_dir=$1 target_dir=$2
+    if [ -L "$target_dir" ] || { [ -e "$target_dir" ] && [ ! -d "$target_dir" ]; }; then
+        printf 'Undo refuses a directory type change: %s\n' "$target_dir" >&2
+        return 1
+    fi
+    for entry in "$source_dir"/.[!.]* "$source_dir"/..?* "$source_dir"/*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        target_entry=$target_dir/${entry##*/}
+        if [ -d "$entry" ] && [ ! -L "$entry" ]; then
+            restore_tree_preflight "$entry" "$target_entry" || return 1
+        elif [ -d "$target_entry" ]; then
+            printf 'Undo refuses to replace a directory with a file: %s\n' "$target_entry" >&2
+            return 1
+        elif [ ! -f "$entry" ] && [ ! -L "$entry" ]; then
+            printf 'Undo refuses a special file: %s\n' "$entry" >&2
+            return 1
+        fi
+    done
+)
+restore_tree_files() (
+    source_dir=$1 target_dir=$2
+    [ ! -L "$target_dir" ] || return 1
+    [ -d "$target_dir" ] || mkdir "$target_dir" || return 1
+    for entry in "$source_dir"/.[!.]* "$source_dir"/..?* "$source_dir"/*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        target_entry=$target_dir/${entry##*/}
+        if [ -d "$entry" ] && [ ! -L "$entry" ]; then
+            restore_tree_files "$entry" "$target_entry" || return 1
+        else
+            [ ! -d "$target_entry" ] || return 1
+            mv -f "$entry" "$target_entry" || return 1
+        fi
+    done
+)
+restore_tree_remove_extras() (
+    source_dir=$1 target_dir=$2
+    for entry in "$target_dir"/.[!.]* "$target_dir"/..?* "$target_dir"/*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        source_entry=$source_dir/${entry##*/}
+        if [ ! -e "$source_entry" ] && [ ! -L "$source_entry" ]; then
+            rm -rf "$entry" || return 1
+        elif [ -d "$source_entry" ] && [ ! -L "$source_entry" ]; then
+            restore_tree_remove_extras "$source_entry" "$entry" || return 1
+        fi
+    done
+)
+restore_tree() (
+    restore_stage=$(mktemp -d "$(dirname "$2")/.demudhra-undo-XXXXXX") || return 1
+    trap 'rm -rf "$restore_stage"' 0
+    if ! cp -pR "$1" "$restore_stage/restored"; then
+        printf 'Undo staging failed; target retained: %s\n' "$2" >&2
+        return 1
+    fi
+    restore_tree_preflight "$restore_stage/restored" "$2" || return 1
+    # Keep the live directory present. Each staged leaf replaces one target atomically.
+    if ! restore_tree_files "$restore_stage/restored" "$2"; then
+        printf 'Undo incomplete; target directory retained: %s. Saved tree: %s\n' "$2" "$1" >&2
+        return 1
+    fi
+    restore_tree_remove_extras "$1" "$2" || return 1
+    # Only empty directories remain in staging, so this copies directory metadata.
+    cp -pR "$restore_stage/restored/." "$2/."
+)
+
+UNDO
+    then return 1; fi
+    log "Backup directory: $backup_run"
+    log "Undo after closing applications: sh $(quote "$backup_run/undo.sh")"
+}
+add_undo() {
+    printf '%s\n' "$1" >> "$backup_run/undo.sh" || return 1
+    log "Undo: $1"
+}
+backup_file() {
+    grep -F -x -q "$1" "$work/backed" && return 0
+    ensure_backup || return 1
+    saved=$backup_run/files$1
+    if ! mkdir -p "$(dirname "$saved")" || ! cp -p "$1" "$saved"; then fail "Backup failed: $1"; return 1; fi
+    add_undo "restore_file $(quote "$saved") $(quote "$1")" || { fail 'Cannot write undo'; return 1; }
+    printf '%s\n' "$1" >> "$work/backed"
+    backed=$((backed + 1))
+}
+# shellcheck disable=SC2329
+backup_tree() {
+    [ -d "$1" ] || return 0
+    safe_path "$1" || { fail "Unsafe output directory: $1"; return 1; }
+    set -- "$resolved"
+    case $backup_base in "$1"|"$1"/*) fail "Backup directory must be outside regenerated tree: $1"; return 1;; esac
+    grep -F -x -q "$1" "$work/backed" && return 0
+    ensure_backup || return 1
+    saved=$backup_run/trees$1
+    if ! mkdir -p "$(dirname "$saved")" || ! cp -pR "$1" "$saved"; then fail "Store snapshot failed: $1"; return 1; fi
+    add_undo "restore_tree $(quote "$saved") $(quote "$1")" || return 1
+    printf '%s\n' "$1" >> "$work/backed"
+    backed=$((backed + 1))
+}
+# Bundle and keystore replacements recheck inspected bytes before rename.
+commit_file() {
+    if ! cmp -s "$1" "$3"; then fail "Changed during scan, left unchanged: $1"; return 1; fi
+    can_modify "$1" || return 1
+    backup_file "$1" || return 1
+    sibling=$(mktemp "$(dirname "$1")/.demudhra-XXXXXX") || { fail "Cannot stage: $1"; return 1; }
+    if cp -p "$1" "$sibling" && cat "$2" > "$sibling" && cmp -s "$1" "$3" && mv -f "$sibling" "$1"; then
+        return 0
+    fi
+    rm -f "$sibling"
+    fail "Atomic replacement failed: $1"
+    return 1
+}
+classify() {
+    case $1 in
+        */cacerts|*/jssecacerts|*.jks|*.p12|*.keystore|*/truststore*) ecosystem=java; return;;
+        */certifi/*|*/site-packages/*|*/dist-packages/*|*/_vendor/*|*/virtualenv*/*|*/venv/*|*/.venv/*|*/conda/*|*/anaconda*/*|*/miniconda*/*|*/pip/*) ecosystem=python; return;;
+        */node_modules/*|*/npm/*) ecosystem=node; return;;
+        */ruby/*|*/gems/*) ecosystem=ruby; return;;
+        */cert9.db|*/cert8.db) ecosystem=nss; return;;
+    esac
+    if [ -n "${BUNDLE_SSL_CA_CERT:-}" ] && [ "$1" = "$BUNDLE_SSL_CA_CERT" ]; then ecosystem=ruby; return; fi
+    if [ -n "${NODE_EXTRA_CA_CERTS:-}" ] && [ "$1" = "$NODE_EXTRA_CA_CERTS" ]; then ecosystem=node; return; fi
+    case ${1#"$root"} in
+        /etc/ssl/*|/private/etc/ssl/*|/etc/pki/*|/etc/ca-certificates/*|/usr/share/pki/*|/usr/share/ca-certificates/*|/usr/local/share/ca-certificates/*|/var/lib/ca-certificates/*) ecosystem=system;;
+        *) ecosystem=bundles;;
+    esac
+}
+ecosystem_enabled() {
+    case $ecosystem in
+        python) [ "$skip_python" = 0 ];; node) [ "$skip_node" = 0 ];;
+        ruby) [ "$skip_ruby" = 0 ];; system) [ "$skip_system" = 0 ];;
+        bundles) [ "$skip_bundles" = 0 ];; java) [ "$skip_java" = 0 ];;
+        nss) [ "$skip_nss" = 0 ];;
+    esac
+}
+protect_skipped_path() {
+    safe_path "$1" || return 0
+    protect_path=$resolved
+    inside_backup "$protect_path" && return 0
+    classify "$protect_path"
+    target_ecosystem=$ecosystem
+    if ! ecosystem_enabled; then printf '%s\n' "$protect_path" >> "$work/protected"; fi
+    classify "$1"
+    # A generic alias does not make a specialized store a generic bundle.
+    if [ "$ecosystem" != bundles ] || [ "$target_ecosystem" = bundles ]; then
+        if ! ecosystem_enabled; then printf '%s\n' "$protect_path" >> "$work/protected"; fi
+    fi
+}
+process_path() {
+    original=$1
+    safe_path "$original" || { fail "Cannot safely resolve (possibly outside test root): $original"; return; }
+    path=$resolved
+    inside_backup "$path" && return
+    excluded_path "$path" && return
+    case $path in "$work"/*|"$backup_base"/*) return;; esac
+    [ -f "$path" ] || { log "SKIP not a regular file: $original"; return; }
+    case ${path#"$root"} in
+        /etc/pki/*/blacklist/*|/etc/pki/*/blocklist/*|/etc/ca-certificates/trust-source/blocklist/*|/etc/ca-certificates/trust-source/blacklist/*) log "SKIP existing distrust record: $path"; return;;
+    esac
+    grep -F -x -q "$path" "$work/protected" && { log "SKIP protected by ecosystem flag: $path"; return; }
+    grep -F -x -q "$path" "$work/seen" && return
+    printf '%s\n' "$path" >> "$work/seen"
+    classify "$path"
+    if [ "$ecosystem" = bundles ]; then classify "$original"; fi
+    [ -r "$path" ] || { unreadable=$((unreadable + 1)); log "not readable (run as root to include): $original"; return; }
+    [ "$(wc -c < "$path")" -le 5242880 ] || return
+    ecosystem_enabled || return
+    case $path in
+        */flatpak/runtime/*)
+            if [ "$apply" = 0 ]; then
+                immutable=$((immutable + 1))
+                log "Flatpak runtime store is report-only: $path. Update the Flatpak runtime."
+            fi
+            case $ecosystem in java|nss) return;; esac
+            inspect_bundle "$path" report
+            return;;
+    esac
+    case $ecosystem in
+        python) [ "$skip_python" = 0 ] || return;;
+        node) [ "$skip_node" = 0 ] || return;;
+        ruby) [ "$skip_ruby" = 0 ] || return;;
+        system) [ "$skip_system" = 0 ] || return;;
+        bundles) [ "$skip_bundles" = 0 ] || return;;
+        java) [ "$skip_java" = 0 ] || return; inspect_java "$path"; return;;
+        nss) [ "$skip_nss" = 0 ] || return; inspect_nss "$path"; return;;
+    esac
+    if [ "$platform" = macos ]; then
+        case ${original#"$root"} in /etc/ssl/cert.pem|/etc//ssl/cert.pem) return;; esac
+        case ${path#"$root"} in /etc/ssl/cert.pem|/private/etc/ssl/cert.pem|/System/*) return;; esac
+    fi
+    inspect_bundle "$path"
+}
+remember_system_bytes() {
+    [ "$platform" = linux ] && [ "$ecosystem" = system ] || return 0
+    [ -s "$2" ] || return 0
+    preserve_count=$((preserve_count + 1))
+    printf '%s\n' "$1" > "$work/preserve-$preserve_count.path"
+    if ! cp -p "$1" "$work/preserve-$preserve_count.bytes" || ! cat "$2" > "$work/preserve-$preserve_count.bytes"; then
+        fail "Cannot retain survivor bytes for $1"; return 1
+    fi
+}
+
+parse_pem() {
+    awk -v size="${3:-$bytes}" -v dir="${2:-$work}" '
+       BEGIN {off=0; header=-1; alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"}
+       {line=$0; sub(/\r$/, "", line); end=off+length($0)+1; if(end>size) end=size
+        if(line=="-----BEGIN CERTIFICATE-----" || line=="-----BEGIN TRUSTED CERTIFICATE-----") {
+           if(inside) {bad=1; exit}; inside=1; start=(header>=0 ? header : off); header=-1; label=line; n++; file=dir "/cert-" n; der=dir "/der-" n; bits=0; value=0; padding=0; emitted=0; total=0; lengthbytes=0; payload=0
+           printf "" > der
+        } else if(inside && line !~ /^-----END /) {
+           gsub(/[ \t]/,"",line)
+           for(j=1;j<=length(line);j++) {
+               ch=substr(line,j,1)
+               if(ch=="=") {padding++; continue}
+               digit=index(alphabet,ch)-1
+               if(digit<0 || padding) {bad=1; exit}
+               value=value*64+digit; bits+=6
+               if(bits>=8) {
+                   bits-=8; power=2^bits; byte=int(value/power); value=value%power; emitted++
+                   if(emitted==1 && byte!=48) {bad=1; exit}
+                   if(emitted==2) {if(byte<128) total=2+byte; else {lengthbytes=byte-128; if(lengthbytes<1 || lengthbytes>4) {bad=1; exit}}}
+                   if(emitted>2 && emitted<=2+lengthbytes) {payload=payload*256+byte; if(emitted==2+lengthbytes) total=2+lengthbytes+payload}
+                   if(!total || emitted<=total) printf "%c",byte > der
+               }
+           }
+        }
+        if(inside) {printf "%s", $0 > file; if(end-off>length($0)) printf "\n" > file}
+        if(line=="-----END CERTIFICATE-----" || line=="-----END TRUSTED CERTIFICATE-----") {
+           if(!inside) {bad=1; exit}
+           expected=label; sub(/BEGIN/,"END",expected)
+           if(line!=expected || !total || emitted<total || padding>2 || (label=="-----BEGIN CERTIFICATE-----" && emitted!=total)) {bad=1; exit}
+           print start, end-start; inside=0; close(file); close(der)
+        }
+        if(!inside && line !~ /^-----END /) {
+            if(line ~ /^=== \/|^### /) {if(header<0) header=off}
+            else if(line !~ /^[ \t]*$/) header=-1
+        }
+        off=end
+       } END {if(inside || bad) exit 1}' "$1"
+}
+
+verify_bundle() {
+    cmp -s "$1" "$work/new" || return 1
+    verify_dir=$work/verify
+    rm -rf "$verify_dir"
+    mkdir "$verify_dir" || return 1
+    verify_size=$(wc -c < "$1" | tr -d ' ')
+    parse_pem "$1" "$verify_dir" "$verify_size" > "$verify_dir/ranges" || return 1
+    [ -s "$verify_dir/ranges" ] || return 0
+    openssl dgst -sha256 "$verify_dir"/der-* > "$verify_dir/hashes" 2>/dev/null || return 1
+    awk 'NR==FNR {selected[$1]=1; next} tolower($NF) in selected {bad=1} END {exit bad}' "$work/selected" "$verify_dir/hashes"
+}
+
+# awk records byte offsets. The copier preserves every surviving input byte.
+inspect_bundle() {
+    bundle=$1 policy=${2:-edit}
+    if [ "$apply" = 1 ] && [ "$policy" != report ]; then
+        bundle_plan=$(DEMUDHRA_LOOKUP_PATH="$bundle" awk -F '\t' '$1==ENVIRON["DEMUDHRA_LOOKUP_PATH"] {print $2; exit}' "$work/bundle-plans")
+        [ -n "$bundle_plan" ] || return 0
+        bundle_plan=$work/bundle-$bundle_plan
+        if ! cmp -s "$bundle" "$bundle_plan/original"; then fail "Changed during scan, left unchanged: $bundle"; return; fi
+        rm -f "$work/original" "$work/new" "$work/info" "$work/system-match-"*.pem
+        for plan_file in "$bundle_plan/"*; do cp "$plan_file" "$work/" || { fail "Cannot load reviewed bundle plan: $bundle"; return; }; done
+        read -r bundle_hits bytes pure_bundle < "$bundle_plan/info"
+        found=$((found + bundle_hits))
+        apply_bundle
+        return
+    fi
+    rm -f "$work/original"
+    cp "$bundle" "$work/original" 2>/dev/null || { fail "Cannot read: $bundle"; return; }
+    bytes=$(wc -c < "$work/original" | tr -d ' ')
+    rm -f "$work/cert-"* "$work/der-"*
+    if ! parse_pem "$work/original" > "$work/ranges"; then
+        malformed; return
+    fi
+    if [ -s "$work/ranges" ]; then
+        openssl dgst -sha256 "$work"/der-* > "$work/hashes" 2>/dev/null || { malformed; return; }
+    fi
+    : > "$work/remove"
+    rm -f "$work/system-match-"*.pem
+    bundle_hits=0 bundle_bad=0 cert_index=0
+    if [ ! -s "$work/ranges" ]; then
+        case $bundle in
+            *.der|*.cer|*.crt) if openssl x509 -inform DER -in "$work/original" -outform DER -out "$work/der" 2>/dev/null; then
+                    hash=$(file_hash "$work/der")
+                    if selected "$hash"; then
+                        printf '0 %s\n' "$bytes" > "$work/remove"; bundle_hits=1; log "FOUND DER $hash $bundle"
+                        if [ "$ecosystem" = system ]; then
+                            openssl x509 -inform DER -in "$work/original" -out "$work/system-match-1.pem" 2>/dev/null || { fail "Cannot stage DER system distrust: $bundle"; return; }
+                        fi
+                    fi
+                fi;;
+        esac
+    else
+        awk '
+            FILENAME==ARGV[1] {selected[$1]=1; next}
+            FILENAME==ARGV[2] {h=tolower($NF); if(h in selected) {id=$0; sub(/^.*\/der-/,"",id); sub(/\)=.*$/,"",id); hashes[id]=h}; next}
+            FNR in hashes {print FNR, $1, $2, hashes[FNR]}
+        ' "$work/selected" "$work/hashes" "$work/ranges" > "$work/selected-blocks"
+        while read -r cert_index start count hash; do
+            cp "$work/cert-$cert_index" "$work/cert" || { fail "Cannot extract PEM bytes: $bundle"; bundle_bad=1; break; }
+            if selected "$hash"; then
+                checked_hash=$(fingerprint "$work/cert") || { malformed; bundle_bad=1; break; }
+                [ "$checked_hash" = "$hash" ] || { malformed; bundle_bad=1; break; }
+                bundle_hits=$((bundle_hits + 1))
+                log "FOUND $ecosystem $hash $bundle"
+                printf '%s %s\n' "$start" "$count" >> "$work/remove"
+                if [ "$ecosystem" = system ]; then
+                    openssl x509 -in "$work/cert" -out "$work/system-match-$bundle_hits.pem" 2>/dev/null || { fail "Cannot stage system distrust: $bundle"; bundle_bad=1; break; }
+                fi
+            fi
+        done < "$work/selected-blocks"
+    fi
+    [ "$bundle_bad" = 0 ] || return 0
+    found=$((found + bundle_hits))
+    [ "$bundle_hits" = 0 ] || match_place "$ecosystem" "$bundle" "$bundle_hits"
+    if [ "$bundle_hits" = 0 ]; then
+        [ "$policy" = report ] || remember_system_bytes "$bundle" "$work/original"
+        return 0
+    fi
+    if [ "$policy" = report ]; then log "NOT REMOVED: $bundle. Manual step: update the OS/runtime trust store, then rerun --dry-run for this path."; manual_remaining=$((manual_remaining + bundle_hits)); return; fi
+    log "Would remove $bundle_hits certificate(s) from $bundle"
+    if [ ! -s "$work/ranges" ]; then : > "$work/new"
+    elif ! awk -v size="$bytes" '
+        NR==FNR {start[++n]=$1; stop[n]=$1+$2; next}
+        {end=offset+length($0)+1; if(end>size) end=size
+         keep=1; for(i=1;i<=n;i++) if(offset>=start[i] && offset<stop[i]) {keep=0; break}
+         if(keep) {printf "%s", $0; if(end-offset>length($0)) printf "\n"}
+         offset=end}
+    ' "$work/remove" "$work/original" > "$work/new"; then
+        fail "Cannot build replacement: $bundle"; return
+    fi
+    pure_bundle=0
+    if [ "$bytes" -gt 0 ] && [ -s "$work/ranges" ] &&
+        awk -v size="$bytes" '{if($1!=offset) {bad=1; exit}; offset=$1+$2} END {if(bad || offset!=size) exit 1}' "$work/ranges"; then pure_bundle=1; fi
+    bundle_plan_count=$((bundle_plan_count + 1))
+    bundle_plan=$work/bundle-$bundle_plan_count
+    mkdir "$bundle_plan" || { fail "Cannot save reviewed bundle: $bundle"; return; }
+    printf '%s %s %s\n' "$bundle_hits" "$bytes" "$pure_bundle" > "$bundle_plan/info"
+    for plan_file in "$work/original" "$work/new" "$work/system-match-"*.pem; do
+        [ ! -f "$plan_file" ] || cp "$plan_file" "$bundle_plan/" || { fail "Cannot save reviewed bundle: $bundle"; return; }
+    done
+    printf '%s\t%s\n' "$bundle" "$bundle_plan_count" >> "$work/bundle-plans"
+}
+apply_bundle() {
+    can_modify "$bundle" || return
+    if [ "$ecosystem" = system ]; then
+        platform_system_backup || return
+        platform_block_matches || return
+    fi
+    if commit_file "$bundle" "$work/new" "$work/original"; then
+        if ! verify_bundle "$bundle"; then fail "Certificate re-verification failed after removal: $bundle. Restore from the printed backup."; return; fi
+        removed=$((removed + bundle_hits))
+        remember_system_bytes "$bundle" "$work/new" || return
+        if [ "$pure_bundle" = 1 ] && [ ! -s "$bundle" ]; then
+            rm -f "$bundle" || fail "Cannot remove empty bundle: $bundle"
+        fi
+        if [ "$ecosystem" = system ]; then platform_system_changed; fi
+        if [ -f "$bundle" ] && [ ! -s "$bundle" ]; then printf '%s\n' "$bundle" >> "$work/empty"; fi
+        log "REMOVED $bundle_hits certificate(s) from $bundle (verified by re-parsing)"
+    fi
+}
+
+excluded_path() {
+    case $1 in
+        "$work"|"$work"/*|"$backup_base"|"$backup_base"/*) return 0;;
+        "$root"/var/lib/docker|"$root"/var/lib/docker/*|"$root"/var/lib/containers|"$root"/var/lib/containers/*|"$root"/var/lib/containerd|"$root"/var/lib/containerd/*|"$root"/var/lib/snapd|"$root"/var/lib/snapd/*|"$root"/snap|"$root"/snap/*|"$root"/var/lib/lxc*|"$root"/nix/store|"$root"/nix/store/*|"$root"/proc/*|"$root"/sys/*|*/overlay/*|*/overlay2/*) return 0;;
+    esac
+    if [ -z "$root" ]; then
+        case $1 in "$script_dir"|"$script_dir"/*|*/tests/fixtures/*) return 0;; esac
+    fi
+    while IFS= read -r excluded_mount; do
+        case $1 in "$excluded_mount"|"$excluded_mount"/*) return 0;; esac
+    done < "$work/mount-prunes"
+    return 1
+}
+scan_tree() {
+    scan_root=$1
+    [ -d "$scan_root" ] || return 0
+    excluded_path "$scan_root" && return 0
+    inside_backup "$scan_root/.demudhra-scan" && return 0
+    progress "Scanning $scan_root ..."
+    set -- "$scan_root/"
+    if [ "$deep" = 0 ]; then set -- "$@" -maxdepth "${scan_depth:-7}"; fi
+    set -- "$@" \( -path "$backup_base" -o -path "$work" -o -path "$root/var/run" -o -path "$root/var/cache" \
+        -o -path "$root/var/lib/docker" -o -path "$root/var/lib/containers" -o -path "$root/var/lib/containerd" \
+        -o -path "$root/var/lib/snapd" -o -path "$root/var/lib/lxc*" -o -path "$root/snap" \
+        -o -path "$root/nix/store" -o -path "$root/proc" -o -path "$root/sys" -o -path "$root/dev" \
+        -o -name overlay -o -name overlay2 -o -name .git \
+        -o -name 'Electron Framework.framework' -o -name 'Chromium Embedded Framework.framework' \
+        -o -name DerivedData -o -name iOS\ DeviceSupport -o -name Archives
+    if [ -z "$root" ]; then
+        set -- "$@" -o -path "$script_dir" -o -path '*/tests/fixtures' -o -name .cache -o -path '*/go/pkg/mod'
+    fi
+    while IFS= read -r excluded_mount; do set -- "$@" -o -path "$excluded_mount"; done < "$work/mount-prunes"
+    # Candidate contents are checked against backup ancestry before inspection.
+    set -- "$@" \) -prune
+    if [ "$deep" = 0 ] && [ "${scan_depth:-7}" = 5 ]; then
+        set -- "$@" -o -type d \( -name .venv -o -name venv -o -name node_modules -o -name site-packages -o -name dist-packages \) -print -prune
+    fi
+    set -- "$@" -o \( -type f -o -type l \) \
+        -size -5242881c \( -name '*.pem' -o -name '*.crt' -o -name '*.cer' -o -name '*.der' -o -name '*.jks' -o -name '*.p12' \
+        -o -name 'ca-bundle*' -o -name '*.keystore' -o -name 'truststore*' -o -name cacerts -o -name jssecacerts -o -name cert9.db -o -name cert8.db \)
+    # shellcheck disable=SC2016
+    find "$@" -exec sh -c '
+      for p do case $p in *"$(printf "\t")"*|*"
+"*) printf "Unrepresentable path under scan\n" >&2;; *) printf "%s\n" "$p";; esac; done
+    ' sh {} + >> "$work/paths" 2>> "$work/find.err" || :
+}
+queue_target() {
+    target_path=$1
+    [ -n "$target_path" ] || return 0
+    case $target_path in \~/*) target_path=${HOME:-/nonexistent}/${target_path#\~/};; esac
+    case $target_path in /*) :;; *) target_path=$PWD/$target_path;; esac
+    if [ -n "$root" ]; then case $target_path in "$root"/*) :;; *) return 0;; esac; fi
+    plain_path "$target_path" || return 0
+    excluded_path "$target_path" && return 0
+    [ -f "$target_path" ] || return 0
+    printf '%s\n' "$target_path" >> "$work/paths"
+}
+scan_home() {
+    scan_home_path=$1
+    [ -d "$scan_home_path" ] || return 0
+    scan_depth=14
+    for tree in "$scan_home_path/.mozilla" "$scan_home_path/.pki" \
+        "$scan_home_path/.config/google-chrome" "$scan_home_path/.config/chromium" \
+        "$scan_home_path/.local/lib" "$scan_home_path/.pyenv" "$scan_home_path/.nvm/versions" \
+        "$scan_home_path/.asdf/installs" "$scan_home_path/.local/share/mise/installs" \
+        "$scan_home_path/.rtx" "$scan_home_path/.sdkman/candidates" "$scan_home_path/.gradle/jdks" \
+        "$scan_home_path/.jdks" "$scan_home_path/.rbenv/versions" "$scan_home_path/.rvm" \
+        "$scan_home_path/.volta" "$scan_home_path/.fnm" "$scan_home_path/.local/share/fnm" \
+        "$scan_home_path/.local/pipx/venvs" "$scan_home_path/.local/share/pipx" \
+        "$scan_home_path/.local/share/uv" "$scan_home_path/.rye" \
+        "$scan_home_path/miniconda3" "$scan_home_path/anaconda3" "$scan_home_path/miniforge3" \
+        "$scan_home_path/mambaforge" "$scan_home_path/micromamba" "$scan_home_path/.conda" \
+        "$scan_home_path/google-cloud-sdk" "$scan_home_path/.local/aws-cli" \
+        "$scan_home_path/.azure-cli-env" "$scan_home_path/.vscode/extensions" \
+        "$scan_home_path/.cursor/extensions" "$scan_home_path/.local/share/JetBrains" \
+        "$scan_home_path/.local/share/flatpak/runtime"; do scan_tree "$tree"; done
+    if [ "$platform" = macos ]; then
+        for tree in "$scan_home_path/Library/Java/JavaVirtualMachines" \
+            "$scan_home_path/Library/Application Support/JetBrains" \
+            "$scan_home_path/Library/Application Support/Firefox/Profiles"; do scan_tree "$tree"; done
+    fi
+    scan_depth=5
+    for tree in "$scan_home_path/projects" "$scan_home_path/src" "$scan_home_path/code" \
+        "$scan_home_path/dev" "$scan_home_path/.venv" "$scan_home_path/venv"; do scan_tree "$tree"; done
+    config_targets "$scan_home_path"
+}
+config_targets() {
+    config_home=$1
+    for config_file in "$config_home/.npmrc" "$config_home/.pip/pip.conf" \
+        "$config_home/.config/pip/pip.conf" "$config_home/.config/pip/pip.ini" \
+        "$config_home/pip.ini" "$config_home/pip/pip.ini" \
+        "$config_home/.pip/pip.ini" "$config_home/.curlrc" "$config_home/.wgetrc" \
+        "$config_home/Library/Application Support/pip/pip.conf"; do
+        [ -r "$config_file" ] || continue
+        awk '
+          /^[[:space:]]*[#;]/ {next}
+          {line=$0; sub(/^[[:space:]]*/,"",line)
+           if(line ~ /^(cafile|cert|ca_certificate)[[:space:]]*=/) sub(/^[^=]*=[[:space:]]*/,"",line)
+           else if(line ~ /^(--)?cacert([[:space:]]|=)/) sub(/^(--)?cacert[[:space:]=]*/,"",line)
+           else next
+           sub(/[[:space:]]*$/, "", line)
+           if(line ~ /^".*"$/ || line ~ /^\047.*\047$/) line=substr(line,2,length(line)-2)
+           if(length(line)) print line}
+        ' "$config_file" > "$work/config-targets"
+        while IFS= read -r config_target; do
+            case $config_target in \~/*) config_target=$config_home/${config_target#\~/};; esac
+            queue_target "$config_target"
+        done < "$work/config-targets"
+    done
+}
+discover_known() {
+    scan_depth=14
+    for tree in "$root"/etc/ssl "$root"/etc/pki "$root"/etc/ca-certificates \
+        "$root"/usr/share/ca-certificates "$root"/usr/share/ca-certificates-java \
+        "$root"/usr/share/pki "$root"/usr/local/share/ca-certificates "$root"/var/lib/ca-certificates \
+        "$root"/usr/lib/ssl "$root"/usr/local/ssl "$root"/usr/lib/jvm "$root"/usr/java \
+        "$root"/usr/lib/python* "$root"/usr/local/lib/python* "$root"/usr/local/lib/node_modules \
+        "$root"/usr/share/nodejs "$root"/opt/java "$root"/opt/jdk* "$root"/opt/conda \
+        "$root"/opt/miniconda* "$root"/opt/anaconda* "$root"/usr/lib/google-cloud-sdk \
+        "$root"/opt/google-cloud-sdk "$root"/usr/local/aws-cli "$root"/opt/az \
+        "$root"/var/lib/flatpak/runtime; do scan_tree "$tree"; done
+    if [ "$platform" = macos ]; then
+        for tree in "$root"/Library/Java/JavaVirtualMachines "$root"/Library/Frameworks \
+            "$root"/Library/Developer/CommandLineTools "$root"/Applications/Xcode*.app/Contents/Developer \
+            "$root"/Applications/*.app/Contents "$root"/opt/homebrew/etc \
+            "$root"/opt/homebrew/lib/python* \
+            "$root"/opt/homebrew/Cellar "$root"/usr/local/etc/openssl* \
+            "$root"/usr/local/etc/ca-certificates "$root"/usr/local/Cellar \
+            "$root"/opt/local/etc/openssl "$root"/opt/local/share/curl; do scan_tree "$tree"; done
+    fi
+    : > "$work/homes"
+    for scan_home in "$root"/home/* "$root"/root "$root"/Users/* "${HOME:-/nonexistent}"; do
+        [ -d "$scan_home" ] || continue
+        if [ -n "$root" ]; then case $scan_home in "$root"/*) :;; *) continue;; esac; fi
+        printf '%s\n' "$scan_home" >> "$work/homes"
+    done
+    sort -u "$work/homes" > "$work/unique-homes"
+    while IFS= read -r scan_home; do scan_home "$scan_home"; done < "$work/unique-homes"
+    scan_depth=5
+    for tree in "$root"/opt "$root"/app "$root"/srv "$root"/workspace "$root"/work \
+        "$root"/home "$root"/root "$root"/usr/local; do scan_tree "$tree"; done
+    if [ "$platform" = linux ]; then
+        while IFS= read -r scan_home; do scan_tree "$scan_home"; done < "$work/unique-homes"
+    fi
+    sort -u "$work/paths" > "$work/nested-paths"
+    scan_depth=14
+    while IFS= read -r nested; do [ ! -d "$nested" ] || scan_tree "$nested"; done < "$work/nested-paths"
+    if [ "$deep" = 1 ]; then
+        for tree in "$root"/etc "$root"/usr "$root"/var; do scan_tree "$tree"; done
+    else log 'Default scan covers known trust stores and a bounded search of likely application and home directories. Use --deep for a broader search.'; fi
+}
+external_targets() {
+    for env_path in "${NODE_EXTRA_CA_CERTS:-}" "${SSL_CERT_FILE:-}" "${CURL_CA_BUNDLE:-}" \
+        "${REQUESTS_CA_BUNDLE:-}" "${AWS_CA_BUNDLE:-}" "${GIT_SSL_CAINFO:-}" "${PIP_CERT:-}" \
+        "${NPM_CONFIG_CAFILE:-}" "${npm_config_cafile:-}" "${HTTPLIB2_CA_CERTS:-}" \
+        "${GRPC_DEFAULT_SSL_ROOTS_FILE_PATH:-}" "${CARGO_HTTP_CAINFO:-}" "${DENO_CERT:-}" \
+        "${BUNDLE_SSL_CA_CERT:-}"; do
+        [ -n "$env_path" ] || continue
+        case $env_path in /*) :;; *) env_path=$PWD/$env_path;; esac
+        if [ -n "$root" ]; then case $env_path in "$root"/*) :;; *) continue;; esac; fi
+        excluded_path "$env_path" && continue
+        [ -e "$env_path" ] || { fail "Environment bundle does not exist: $env_path"; continue; }
+        queue_target "$env_path"
+    done
+    cert_dirs=${SSL_CERT_DIR:-}:
+    while [ -n "$cert_dirs" ]; do
+        cert_dir=${cert_dirs%%:*}
+        cert_dirs=${cert_dirs#*:}
+        [ -d "$cert_dir" ] || continue
+        if [ -n "$root" ]; then case $cert_dir in "$root"/*) :;; *) continue;; esac; fi
+        excluded_path "$cert_dir" && continue
+        find "$cert_dir/" -maxdepth 1 \( -type f -o -type l \) \
+            -name '[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F].[0-9]*' \
+            -print > "$work/hashed-paths" 2>> "$work/find.err"
+        while IFS= read -r hashed_path; do
+            case ${hashed_path##*.} in ''|*[!0-9]*) continue;; esac
+            queue_target "$hashed_path"
+        done < "$work/hashed-paths"
+    done
+    for java_store in "${JAVA_HOME:-/nonexistent}/lib/security/cacerts" \
+        "${JAVA_HOME:-/nonexistent}/jre/lib/security/cacerts"; do queue_target "$java_store"; done
+    java_dirs=$PATH:
+    while [ -n "$java_dirs" ]; do
+        java_bin_dir=${java_dirs%%:*}
+        java_dirs=${java_dirs#*:}
+        [ -n "$java_bin_dir" ] || java_bin_dir=.
+        case $java_bin_dir in /*) :;; *) java_bin_dir=$PWD/$java_bin_dir;; esac
+        [ -x "$java_bin_dir/java" ] || continue
+        safe_path "$java_bin_dir/java" || continue
+        java_base=${resolved%/bin/java}
+        [ "$java_base" != "$resolved" ] || java_base=${resolved%/*}/..
+        queue_target "$java_base/lib/security/cacerts"
+        queue_target "$java_base/jre/lib/security/cacerts"
+    done
+    if command -v git >/dev/null 2>&1; then
+        for git_scope in global system; do
+            if [ -n "$root" ]; then
+                GIT_CONFIG_SYSTEM="$root/etc/gitconfig" git config "--$git_scope" --get http.sslCAInfo > "$work/git-targets" 2>/dev/null || :
+            else git config "--$git_scope" --get http.sslCAInfo > "$work/git-targets" 2>/dev/null || :; fi
+            while IFS= read -r git_target; do queue_target "$git_target"; done < "$work/git-targets"
+        done
+    fi
+    for config_file in "$root/etc/pip.conf" "$root/etc/xdg/pip/pip.conf" \
+        "$root/Library/Application Support/pip/pip.conf"; do
+        [ -r "$config_file" ] || continue
+        awk '/^[[:space:]]*cert[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*/,""); sub(/[[:space:]]*$/,""); print}' "$config_file" > "$work/config-targets"
+        while IFS= read -r config_target; do queue_target "$config_target"; done < "$work/config-targets"
+    done
+}
+discover() {
+    : > "$work/paths"
+    # DEMUDHRA_TEST_ONLY_BEGIN
+    if [ -n "$root" ] && [ "${DEMUDHRA_TEST_DEFAULT_SCAN:-}" != 1 ]; then
+        scan_depth=64
+        if [ "$platform" = linux ]; then scan_tree "$root"
+        else for tree in etc var home root opt usr srv Library/Frameworks Library/Java/JavaVirtualMachines Applications; do scan_tree "$root/$tree"; done; fi
+    else
+    # DEMUDHRA_TEST_ONLY_END
+        discover_known
+    # DEMUDHRA_TEST_ONLY_BEGIN
+    fi
+    # DEMUDHRA_TEST_ONLY_END
+    external_targets
+    if [ -s "$work/find.err" ]; then
+        sed 's#//*#/#g' "$work/find.err" | sort -u > "$work/find-unique.err"
+        while IFS= read -r scan_error; do
+            case $scan_error in
+                *'Permission denied'*|*'Operation not permitted'*) unreadable=$((unreadable + 1)); [ "$verbose" = 0 ] || log "not readable (run as root to include): $scan_error";;
+                *) fail "$scan_error";;
+            esac
+        done < "$work/find-unique.err"
+    fi
+    sort -u "$work/paths" > "$work/unique-paths"
+    if [ "$skip_python$skip_node$skip_ruby$skip_system$skip_bundles$skip_java$skip_nss" != 0000000 ]; then
+        while IFS= read -r candidate; do protect_skipped_path "$candidate"; done < "$work/unique-paths"
+    fi
+    candidates=0
+    while IFS= read -r candidate; do
+        candidates=$((candidates + 1))
+        if [ "$((candidates % 100))" = 0 ]; then progress "Inspected $candidates candidate paths ..."; fi
+        [ -d "$candidate" ] || process_path "$candidate"
+    done < "$work/unique-paths"
+}
+report_runtimes() {
+    for runtime in node go deno bun rustup cargo; do
+        runtime_path=$(command -v "$runtime" 2>/dev/null) || continue
+        if [ -n "$root" ]; then
+            # DEMUDHRA_TEST_ONLY_BEGIN
+            [ "${DEMUDHRA_TEST_RUNTIMES:-}" = 1 ] || continue
+            safe_path "$runtime_path" || continue
+            # DEMUDHRA_TEST_ONLY_END
+            :
+        fi
+        [ "$runtime" = go ] || immutable=$((immutable + 1))
+        case $runtime in
+            node) runtime_version=$(NODE_OPTIONS='' NODE_EXTRA_CA_CERTS='' "$runtime_path" --version 2>/dev/null);;
+            go) runtime_version=$(GOTOOLCHAIN=local "$runtime_path" version 2>/dev/null);;
+            rustup|cargo) runtime_version=$(RUSTUP_AUTO_INSTALL=0 "$runtime_path" --version 2>/dev/null);;
+            *) runtime_version=$("$runtime_path" --version 2>/dev/null);;
+        esac
+        runtime_version=$(printf '%s\n' "$runtime_version" | sed -n '1p')
+        [ -n "$runtime_version" ] || runtime_version='version unavailable'
+        case $runtime_version in "$runtime "*) :;; *) runtime_version="$runtime $runtime_version";; esac
+        case $runtime in
+            go) log "$runtime_version: Go uses the system trust store, which this run cleans; binaries that embed their own roots (e.g. x509roots/fallback) need a rebuild";;
+            rustup|cargo) log "$runtime_version: Rust builds may use webpki-roots, update roots and rebuild Rust applications";;
+            *) log "$runtime_version: built-in roots, update $runtime";;
+        esac
+    done
+    log 'Container/image layers and snaps are not touched. Rebuild images from updated base images and trust packages; refresh snaps through their publisher.'
+}
+can_modify() {
+    if [ -w "$1" ] && [ -w "$(dirname "$1")" ]; then return 0; fi
+    if [ "$(id -u)" != 0 ]; then
+        if ! grep -F -x -q "$1" "$work/needs-root"; then printf '%s\n' "$1" >> "$work/needs-root"; fi
+        log "NEEDS ROOT: $1"
+    else fail "Apply needs write permission: $1"; fi
+    return 1
+}
+have_terminal() {
+    { [ -t 0 ] || [ -t 1 ]; } && ( : < /dev/tty ) 2>/dev/null && ( : > /dev/tty ) 2>/dev/null
+}
+confirm() {
+    printf '%s' "$1" > /dev/tty
+    answer=''
+    IFS= read -r answer < /dev/tty || return 1
+    case $answer in y|Y) return 0;; *) return 1;; esac
+}
+scan_pass() {
+    found=0 removed=0 backed=0 failed=0 immutable=0 manual_remaining=0 unreadable=0 preserve_count=0 malformed_count=0 bundle_plan_count=0
+    for record in seen protected backed find.err empty needs-root matches targets bundle-plans store-plans mac-plans; do : > "$work/$record"; done
+    platform_prepare
+    discover
+    platform_main
+}
+summary() {
+    if [ -s "$work/empty" ]; then
+        log 'WARNING: these files now contain zero certificates. Empty bundles can break certificate loaders:'
+        cat "$work/empty"
+        log 'Manual step: configure the application to use an updated nonempty CA bundle, or remove the unused file.'
+    fi
+    if [ "$unreadable" -gt 0 ]; then log "$unreadable paths not readable (run as root to include)."; fi
+    [ "$verbose" = 0 ] || log "Skipped malformed certificate files: $malformed_count"
+    log "Summary: found=$found removed=$removed backed_up=$backed failed=$failed cannot_change=$immutable manual_remaining=$manual_remaining unreadable=$unreadable"
+}
+grouped_summary() {
+    places=$(cut -f 2 "$work/matches" | sort -u | wc -l | tr -d ' ')
+    awk -F '\t' -v verbose="$verbose" -v color="$([ -t 1 ] && [ -z "${NO_COLOR+x}" ] && printf 1)" '
+      function group(e) {if(e=="system" || e=="keychain") return 1; if(e=="java") return 2; if(e=="nss") return 3; if(e=="python") return 4; if(e=="node") return 5; return 6}
+      BEGIN {labels[1]="OS trust store"; labels[2]="Java"; labels[3]="Firefox/Chrome NSS"; labels[4]="Python"; labels[5]="Node"; labels[6]="Other"}
+      {g=group($1); certs[g]+=$3; key=g SUBSEP $2; if(!seen[key]++) {paths[g,++counts[g]]=$2}}
+      END {for(g=1;g<=6;g++) {if(color) printf "\033[1m"; printf "%s: %d certs in %d places",labels[g],certs[g],counts[g]; if(color) printf "\033[0m"; print ""
+        for(i=1;i<=counts[g] && (verbose || i<=5);i++) print "  " paths[g,i]
+        if(!verbose && counts[g]>5) printf "  ... %d more paths; use --verbose\n",counts[g]-5}}
+    ' "$work/matches"
+}
+main() {
+    parse_args "$@"
+    LC_ALL=C; export LC_ALL
+    umask 077
+    root='' backup_run='' preserve_count=0 found=0 removed=0 backed=0 failed=0 immutable=0 manual_remaining=0 unreadable=0 ecosystem=bundles
+    # DEMUDHRA_TEST_ONLY_BEGIN
+    if [ "${DEMUDHRA_TESTING:-}" != 1 ]; then
+        unset DEMUDHRA_TEST_ROOT DEMUDHRA_TEST_FINGERPRINTS DEMUDHRA_TEST_REGEN DEMUDHRA_TEST_SECURITY
+    fi
+    if [ "${DEMUDHRA_TESTING:-}" = 1 ] && [ "${DEMUDHRA_TEST_ROOT+x}" = x ]; then
+        log '!!! WARNING: DEMUDHRA_TEST_ROOT is active. TEST FILESYSTEM ONLY. !!!' >&2
+        case $DEMUDHRA_TEST_ROOT in /*) :;; *) log 'TEST_ROOT must be an absolute directory, never /' >&2; exit 1;; esac
+        root=$(CDPATH='' cd -P "$DEMUDHRA_TEST_ROOT" 2>/dev/null && pwd -P) || exit 1
+        [ "$root" != / ] || { log 'TEST_ROOT cannot be /' >&2; exit 1; }
+    fi
+    # DEMUDHRA_TEST_ONLY_END
+    work=$(mktemp -d "${TMPDIR:-/tmp}/demudhra-work-XXXXXX") || exit 1
+    trap 'rm -rf "$work"' 0
+    trap 'exit 2' 1 2 3 15
+    for required in openssl awk cmp find mktemp readlink sort; do command -v "$required" >/dev/null 2>&1 || { log "Missing required command: $required" >&2; exit 1; }; done
+    canonical_backup_base || { log "Invalid backup directory: $backup_base" >&2; exit 1; }
+    : > "$work/mount-prunes"
+    if [ -r "$root/proc/self/mountinfo" ]; then
+        awk '$0 ~ / - (squashfs|overlay) / && $5!="/" {p=$5; gsub(/\\040/," ",p); print p}' "$root/proc/self/mountinfo" | while IFS= read -r mount_path; do printf '%s%s\n' "$root" "$mount_path"; done > "$work/mount-prunes"
+    elif [ "$platform" = macos ] && command -v mount >/dev/null 2>&1; then
+        mount | awk '/ on .* \(squashfs[,)]/ {sub(/^.* on /,""); sub(/ \(.*$/,""); print}' > "$work/mount-prunes"
+    fi
+    for forbidden in /var/lib/docker /var/lib/containers /var/lib/containerd /var/lib/snapd /snap /nix/store /proc /sys /dev /var/run /var/cache; do
+        if [ -d "$root$forbidden" ] && safe_path "$root$forbidden"; then printf '%s\n' "$resolved" >> "$work/mount-prunes"; fi
+    done
+    for forbidden in "$root"/var/lib/lxc*; do
+        if [ -d "$forbidden" ] && safe_path "$forbidden"; then printf '%s\n' "$resolved" >> "$work/mount-prunes"; fi
+    done
+    load_table
+    if [ "$list" = 1 ]; then cat "$work/table"; exit 0; fi
+    log 'Mode: scan and report. Nothing changes until y or --yes.'
+    log "Skips: system=$skip_system java=$skip_java nss=$skip_nss python=$skip_python node=$skip_node ruby=$skip_ruby bundles=$skip_bundles keychains=$skip_keychains"
+    scan_pass
+    report_runtimes
+    grouped_summary
+    summary
+    if [ "$run_mode" = dry ]; then
+        log 'dry run: nothing changed. run again in a terminal to remove, or pass --yes.'
+        [ "$failed" = 0 ] || exit 2
+        [ "$found" = 0 ] || exit 10
+        exit 0
+    fi
+    if [ "$found" = 0 ]; then [ "$failed" = 0 ] || exit 2; exit 0; fi
+    if [ "$run_mode" != yes ]; then
+        if ! have_terminal; then
+            log 'No terminal was available. Nothing changed; use --yes for unattended removal.'
+            [ "$failed" = 0 ] || exit 2
+            exit 10
+        fi
+        if ! confirm "found $found certs in $places places. remove them? [y/N] "; then log 'Nothing changed. Removal declined.'; exit 11; fi
+    fi
+    while IFS="$(printf '\t')" read -r reviewed_path reviewed_plan; do
+        if ! cmp -s "$reviewed_path" "$work/bundle-$reviewed_plan/original"; then
+            fail "Changed during scan, left unchanged: $reviewed_path"
+            exit 2
+        fi
+    done < "$work/bundle-plans"
+    preserve_index=1
+    while [ "$preserve_index" -le "$preserve_count" ]; do
+        preserve_path=$(cat "$work/preserve-$preserve_index.path")
+        if ! cmp -s "$preserve_path" "$work/preserve-$preserve_index.bytes"; then
+            fail "Changed during scan, left unchanged: $preserve_path"
+            exit 2
+        fi
+        preserve_index=$((preserve_index + 1))
+    done
+    apply=1
+    log 'Mode: removal confirmed. Applying the reviewed targets.'
+    found=0 manual_remaining=0
+    : > "$work/seen"
+    sort -u "$work/targets" > "$work/apply-targets"
+    while IFS= read -r candidate; do process_path "$candidate"; done < "$work/apply-targets"
+    platform_main
+    summary
+    if [ -s "$work/needs-root" ]; then
+        log 'These targets need root:'
+        cat "$work/needs-root"
+        script_file=$0
+        if command -v sudo >/dev/null 2>&1 && have_terminal && [ -f "$script_file" ]; then
+            if confirm 'these need root. re-run with sudo? [y/N] '; then
+                sudo sh "$script_file" "$@" --yes
+                exit "$?"
+            fi
+        fi
+        printf 'Run after reviewing these targets: sudo sh %s' "$(quote "$script_file")"
+        for arg do printf ' %s' "$(quote "$arg")"; done
+        [ "$run_mode" = yes ] || printf ' --yes'
+        printf '\n'
+        exit 4
+    fi
+    [ "$failed" = 0 ] || exit 2
+    [ "$manual_remaining" = 0 ] || exit 3
+    exit 0
+}

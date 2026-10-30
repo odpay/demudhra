@@ -1,0 +1,2 @@
+# Keep raw command output, including interrupted lines and trailing newlines.
+.audit/**/*.log -whitespace

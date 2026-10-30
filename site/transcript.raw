@@ -1,0 +1,58 @@
+!!! WARNING: DEMUDHRA_TEST_ROOT is active. TEST FILESYSTEM ONLY. !!!
+Active set: DEFAULT (17 certificates: emSign ECC Root CA - G3 + 16 intermediates).
+AAA Certificate Services is retained. Apple HT149555 names it and gives an optional removal; Microsoft describes an AAA Certificate Services cross-sign.
+Mode: scan and report. Nothing changes until y or --yes.
+Skips: system=0 java=0 nss=0 python=0 node=0 ruby=0 bundles=0 keychains=0
+Linux distro: debian (ID=debian ID_LIKE=)
+[KScanning /etc/ssl ...
+[KScanning /usr/share/ca-certificates ...
+[KScanning /usr/lib/python3 ...
+[KScanning /home/dev/.pyenv ...
+[KScanning /home/dev/miniconda3 ...
+[KScanning /home/dev/.venv ...
+[KScanning /opt ...
+[KScanning /home ...
+[KScanning /home/dev ...
+[KScanning /home/dev/.venv ...
+[KScanning /home/dev/.venv/ ...
+Default scan covers known trust stores and a bounded search of likely application and home directories. Use --deep for a broader search.
+[KInspected 100 candidate paths ...
+Container/image layers and snaps are not touched. Rebuild images from updated base images and trust packages; refresh snaps through their publisher.
+OS trust store: 2 certs in 2 places
+  /etc/ssl/certs/ca-certificates.crt
+  /usr/share/ca-certificates/mozilla/emSign_ECC_Root_CA_-_G3.crt
+Java: 0 certs in 0 places
+Firefox/Chrome NSS: 0 certs in 0 places
+Python: 4 certs in 4 places
+  /home/dev/.pyenv/versions/3.12.7/lib/python3.12/site-packages/certifi/cacert.pem
+  /home/dev/.venv/lib/python3.13/site-packages/certifi/cacert.pem
+  /home/dev/miniconda3/ssl/cacert.pem
+  /usr/lib/python3/dist-packages/pip/_vendor/certifi/cacert.pem
+Node: 0 certs in 0 places
+Other: 3 certs in 1 places
+  /opt/acme-agent/certs/intermediates.pem
+Summary: found=9 removed=0 backed_up=0 failed=0 cannot_change=0 manual_remaining=0 unreadable=0
+found 9 certs in 7 places. remove them? [y/N] y
+Mode: removal confirmed. Applying the reviewed targets.
+!!! WARNING: TEST-ONLY native regeneration shim active. No host updater will run. !!!
+Backup directory: /home/dev/demudhra-backups/demudhra-20261029T211403Z-Domotx
+Undo after closing applications: sh '/home/dev/demudhra-backups/demudhra-20261029T211403Z-Domotx/undo.sh'
+Undo: restore_tree '/home/dev/demudhra-backups/demudhra-20261029T211403Z-Domotx/trees/etc/ssl/certs' '/etc/ssl/certs'
+Undo: restore_file '/home/dev/demudhra-backups/demudhra-20261029T211403Z-Domotx/files/etc/ssl/certs/ca-certificates.crt' '/etc/ssl/certs/ca-certificates.crt'
+REMOVED 1 certificate(s) from /etc/ssl/certs/ca-certificates.crt (verified by re-parsing)
+Undo: restore_file '/home/dev/demudhra-backups/demudhra-20261029T211403Z-Domotx/files/home/dev/.pyenv/versions/3.12.7/lib/python3.12/site-packages/certifi/cacert.pem' '/home/dev/.pyenv/versions/3.12.7/lib/python3.12/site-packages/certifi/cacert.pem'
+REMOVED 1 certificate(s) from /home/dev/.pyenv/versions/3.12.7/lib/python3.12/site-packages/certifi/cacert.pem (verified by re-parsing)
+Undo: restore_file '/home/dev/demudhra-backups/demudhra-20261029T211403Z-Domotx/files/home/dev/.venv/lib/python3.13/site-packages/certifi/cacert.pem' '/home/dev/.venv/lib/python3.13/site-packages/certifi/cacert.pem'
+REMOVED 1 certificate(s) from /home/dev/.venv/lib/python3.13/site-packages/certifi/cacert.pem (verified by re-parsing)
+Undo: restore_file '/home/dev/demudhra-backups/demudhra-20261029T211403Z-Domotx/files/home/dev/miniconda3/ssl/cacert.pem' '/home/dev/miniconda3/ssl/cacert.pem'
+REMOVED 1 certificate(s) from /home/dev/miniconda3/ssl/cacert.pem (verified by re-parsing)
+Undo: restore_file '/home/dev/demudhra-backups/demudhra-20261029T211403Z-Domotx/files/opt/acme-agent/certs/intermediates.pem' '/opt/acme-agent/certs/intermediates.pem'
+REMOVED 3 certificate(s) from /opt/acme-agent/certs/intermediates.pem (verified by re-parsing)
+Undo: restore_file '/home/dev/demudhra-backups/demudhra-20261029T211403Z-Domotx/files/usr/lib/python3/dist-packages/pip/_vendor/certifi/cacert.pem' '/usr/lib/python3/dist-packages/pip/_vendor/certifi/cacert.pem'
+REMOVED 1 certificate(s) from /usr/lib/python3/dist-packages/pip/_vendor/certifi/cacert.pem (verified by re-parsing)
+Undo: restore_file '/home/dev/demudhra-backups/demudhra-20261029T211403Z-Domotx/files/etc/ca-certificates.conf' '/etc/ca-certificates.conf'
+Persistent packaged CA disable: !mozilla/emSign_ECC_Root_CA_-_G3.crt in /etc/ca-certificates.conf (fingerprint matched)
+Undo: restore_file '/home/dev/demudhra-backups/demudhra-20261029T211403Z-Domotx/files/usr/share/ca-certificates/mozilla/emSign_ECC_Root_CA_-_G3.crt' '/usr/share/ca-certificates/mozilla/emSign_ECC_Root_CA_-_G3.crt'
+REMOVED 1 certificate(s) from /usr/share/ca-certificates/mozilla/emSign_ECC_Root_CA_-_G3.crt (verified by re-parsing)
+Regenerating native system trust from remaining anchors.
+Summary: found=9 removed=9 backed_up=9 failed=0 cannot_change=0 manual_remaining=0 unreadable=0
