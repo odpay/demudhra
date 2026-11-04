@@ -1,6 +1,6 @@
 # shellcheck shell=sh
 # shellcheck disable=SC2034,SC2154
-version=0.1.1
+version=0.1.2
 log() {
     case $* in
         FOUND*|Would\ remove*|WOULD\ REMOVE*)
@@ -480,6 +480,13 @@ inspect_bundle() {
             *.der|*.cer|*.crt) if openssl x509 -inform DER -in "$work/original" -outform DER -out "$work/der" 2>/dev/null; then
                     hash=$(file_hash "$work/der")
                     if selected "$hash"; then
+                        if ! cmp -s "$work/der" "$work/original"; then
+                            log "SKIPPED: $hash $bundle (not an exact single-certificate DER file)"
+                            manual_remaining=$((manual_remaining + 1))
+                            skipped_der=$((skipped_der + 1))
+                            [ "$policy" = report ] || remember_system_bytes "$bundle" "$work/original"
+                            return
+                        fi
                         printf '0 %s\n' "$bytes" > "$work/remove"; bundle_hits=1; log "FOUND DER $hash $bundle"
                         if [ "$ecosystem" = system ]; then
                             openssl x509 -inform DER -in "$work/original" -out "$work/system-match-1.pem" 2>/dev/null || { fail "Cannot stage DER system distrust: $bundle"; return; }
@@ -846,7 +853,7 @@ confirm() {
     case $answer in y|Y) return 0;; *) return 1;; esac
 }
 scan_pass() {
-    found=0 removed=0 backed=0 failed=0 immutable=0 manual_remaining=0 unreadable=0 preserve_count=0 malformed_count=0 bundle_plan_count=0
+    found=0 removed=0 backed=0 failed=0 immutable=0 manual_remaining=0 skipped_der=0 unreadable=0 preserve_count=0 malformed_count=0 bundle_plan_count=0
     for record in seen protected backed find.err empty needs-root matches targets bundle-plans store-plans mac-plans; do : > "$work/$record"; done
     platform_prepare
     discover
@@ -920,7 +927,11 @@ main() {
         [ "$found" = 0 ] || exit 10
         exit 0
     fi
-    if [ "$found" = 0 ]; then [ "$failed" = 0 ] || exit 2; exit 0; fi
+    if [ "$found" = 0 ]; then
+        [ "$failed" = 0 ] || exit 2
+        [ "$manual_remaining" = 0 ] || exit 3
+        exit 0
+    fi
     if [ "$run_mode" != yes ]; then
         if ! have_terminal; then
             log 'No terminal was available. Nothing changed; use --yes for unattended removal.'
@@ -946,7 +957,7 @@ main() {
     done
     apply=1
     log 'Mode: removal confirmed. Applying the reviewed targets.'
-    found=0 manual_remaining=0
+    found=0 manual_remaining=$skipped_der
     : > "$work/seen"
     sort -u "$work/targets" > "$work/apply-targets"
     while IFS= read -r candidate; do process_path "$candidate"; done < "$work/apply-targets"
@@ -955,6 +966,7 @@ main() {
     if [ -s "$work/needs-root" ]; then
         log 'These targets need root:'
         cat "$work/needs-root"
+        [ "$failed" = 0 ] || exit 2
         script_file=$0
         if command -v sudo >/dev/null 2>&1 && have_terminal && [ -f "$script_file" ]; then
             if confirm 'these need root. re-run with sudo? [y/N] '; then

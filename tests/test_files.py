@@ -192,6 +192,73 @@ class FileBehaviour(Sandbox):
         self.undo()
         self.assertEqual(path.read_bytes(), der)
 
+    def test_der_with_trailing_data_is_reported_and_preserved(self):
+        self.env.pop("DEMUDHRA_TEST_FINGERPRINTS")
+        target = (REPO / "tests/fixtures/pem/emsign-ecc-root-ca-g3.pem").read_bytes()
+        unrelated = (REPO / "tests/fixtures/pem/aaa-certificate-services-sectigo.pem").read_bytes()
+        der = command(["openssl", "x509", "-outform", "DER"], input=target).stdout
+        second = command(["openssl", "x509", "-outform", "DER"], input=unrelated).stdout
+        for script in ("demudhra-linux.sh", "demudhra-macos.sh"):
+            with self.subTest(script=script):
+                paths = [self.put(f"opt/trailing-{kind}.{extension}", der + tail)
+                         for extension in ("der", "cer", "crt")
+                         for kind, tail in (("certificate", second), ("data", b"trailing data\x00\xff"))]
+                before = snapshot(self.root)
+                dry = self.invoke("--dry-run", script=script)
+                self.assertEqual(snapshot(self.root), before)
+                output = self.apply(script=script, expected=3)
+                self.assertEqual(snapshot(self.root), before)
+                self.assertFalse(self.backups.exists())
+                for report in (dry, output):
+                    for path in paths:
+                        self.assertIn(str(path), report)
+                    self.assertIn("not an exact single-certificate DER file", report)
+                    self.assertIn(fingerprint(target), report.lower())
+                    self.assertIn("found=0 removed=0", report)
+                    self.assertIn("manual_remaining=6", report)
+
+    def test_der_skip_remains_manual_after_other_removals(self):
+        self.env.pop("DEMUDHRA_TEST_FINGERPRINTS")
+        target = (REPO / "tests/fixtures/pem/emsign-ecc-root-ca-g3.pem").read_bytes()
+        der = command(["openssl", "x509", "-outform", "DER"], input=target).stdout
+        original = der + der
+        skipped = self.put("opt/trailing.crt", original)
+        for script in ("demudhra-linux.sh", "demudhra-macos.sh"):
+            with self.subTest(script=script):
+                skipped.write_bytes(original)
+                exact = self.put("opt/exact.der", der)
+                output = self.apply(script=script, expected=3)
+                self.assertEqual(skipped.read_bytes(), original)
+                self.assert_contents_or_removed(exact, b"")
+                self.assertIn("not an exact single-certificate DER file", output)
+                summary = next(line for line in reversed(output.splitlines()) if line.startswith("Summary:"))
+                self.assertIn("removed=1", summary)
+                self.assertIn("manual_remaining=1", summary)
+
+    def test_skipped_der_survives_native_regeneration(self):
+        self.env.pop("DEMUDHRA_TEST_FINGERPRINTS")
+        target = (REPO / "tests/fixtures/pem/emsign-ecc-root-ca-g3.pem").read_bytes()
+        der = command(["openssl", "x509", "-outform", "DER"], input=target).stdout
+        original = der + der
+        skipped = self.put("etc/ssl/certs/trailing.crt", original)
+        exact = self.put("usr/local/share/ca-certificates/exact.crt", target)
+        shim = self.base / "regen-shim"
+        shim.write_text("""#!/usr/bin/env python3
+import pathlib, subprocess, sys
+path = pathlib.Path(sys.argv[1]) / 'etc/ssl/certs/trailing.crt'
+decoded = subprocess.run(['openssl', 'x509', '-inform', 'DER', '-in', str(path),
+                          '-outform', 'DER'], check=True, capture_output=True, timeout=45)
+path.write_bytes(decoded.stdout)
+print('Fake regeneration rewrote trailing.crt')
+""")
+        shim.chmod(0o755)
+        self.env["DEMUDHRA_TEST_REGEN"] = str(shim)
+        output = self.apply(expected=3)
+        self.assertIn("Fake regeneration rewrote trailing.crt", output)
+        self.assertEqual(skipped.read_bytes(), original)
+        self.assertFalse(exact.exists())
+        self.assertIn("manual_remaining=1", output)
+
     def test_unreadable_file_is_reported(self):
         if os.geteuid() == 0:
             self.skipTest("root can read mode-0000 files")

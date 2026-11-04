@@ -33,8 +33,8 @@
     <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=2083449#c5">integers smaller than 256</a>.
     Anyone can recover them near instantly. Sectigo had cross-signed the same keys, so that's
     <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=2083449#c2">16 certificates</a>.
-    A commenter on Mozilla's bug <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=2083449#c44">counted 107,107 certificates</a>
-    signed with six of those keys logged to CT in under two days, most of them proof-of-concepts for google.com.</p>
+    Within two days, <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=2083449#c44">over 100,000 certificates</a>
+    signed with these keys showed up in CT logs, mostly proof-of-concepts for google.com.</p>
   <p>Chrome, Firefox and Apple's frameworks block them now
     (<a href="https://blog.google/security/protecting-chrome-and-android-users-from-compromised-emudhra-intermediate-ca-certificates/">Google</a>,
     <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=2083449">Mozilla</a>,
@@ -111,10 +111,7 @@
 </section>
 
 <footer>
-  <p>by <a href="https://github.com/odpay">odpay</a> · v{{VERSION}}</p>
-  <!-- repo link, add once odpay/demudhra is public:
-  <p><a href="https://github.com/odpay/demudhra">source</a></p>
-  -->
+  <p>by <a href="https://github.com/odpay">odpay</a> · <a href="https://github.com/odpay/demudhra">source</a> · v{{VERSION}}</p>
 </footer>
 
 </main>

@@ -212,10 +212,7 @@ The list has {n['N_TOTAL']} certificates. A default run removes {n['N_DEFAULT']}
 <code>--include-aaa</code> adds Sectigo's AAA root on top of either.
 Generated from <code>data/fingerprints.tsv</code>, the same file the script reads.</p>
 {chr(10).join(parts)}
-<footer><p>by <a href="https://github.com/odpay">odpay</a> · {n['N_TOTAL']} certificates</p>
-<!-- repo link, add once odpay/demudhra is public:
-<p><a href="https://github.com/odpay/demudhra/blob/master/data/fingerprints.tsv">fingerprints.tsv on github</a></p>
---></footer>
+<footer><p>by <a href="https://github.com/odpay">odpay</a> · <a href="https://github.com/odpay/demudhra">source</a> · {n['N_TOTAL']} certificates</p></footer>
 </main>
 </body>
 </html>

@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.2] - 2026-11-04
+
+- Remove DER files only when the decoded certificate exactly matches the entire file.
+- Exit 2 on errors when targets that need root are also present.
+- Add a source link to the site footers.
+- Use a plainer site header and drop the analytics footer note.
+- Reword the CT log sentence on the home page.
+
 ## [0.1.1] - 2026-10-29
 
 - Expand bounded default scans to developer tools, macOS app bundles, Homebrew,

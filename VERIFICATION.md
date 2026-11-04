@@ -1,5 +1,16 @@
 # Verification
 
+## v0.1.2 (4 November 2026)
+
+No real-system removal ran. `tools/verify.py` passed every suite under dash, sh
+and BusyBox 1.35.0 sh, with ShellCheck 0.10.0 at warning severity (the
+info-level SC2015/SC2317 notes are unchanged from v0.1.1), JDK 21 keytool and
+NSS 3.110 certutil. New regressions: a DER file with a matching certificate plus
+trailing data is reported and left byte-for-byte, and a run with an error plus
+root-needed targets exits 2. `tools/generate.py --check --verify-pems` passed.
+The release was built with `--carry` for v0.1.0 and v0.1.1, each downloaded from
+`https://demudhra.sh/` and checked against its live `SHA256SUMS` first.
+
 Verified on 29 October 2026 for v0.1.1. No real-system removal ran. Apply and
 undo used disposable roots, temporary NSS and Java stores, and macOS security
 shims. Logs are kept locally under the ignored `.build/` directory.

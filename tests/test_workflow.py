@@ -232,6 +232,26 @@ class Workflow(Sandbox):
         self.assertEqual(protected.read_bytes(), self.bad)
         self.assertEqual(user.read_bytes(), self.good)
 
+    def test_failure_takes_precedence_over_root_needed(self):
+        if os.geteuid() == 0:
+            self.skipTest('needs nonroot permissions')
+        self.env.pop('DEMUDHRA_TEST_FINGERPRINTS')
+        certificate = (REPO / 'tests/fixtures/pem/emsign-ecc-root-ca-g3.pem').read_bytes()
+        protected = self.put('opt/protected.pem', certificate)
+        protected.chmod(0o400)
+        self.addCleanup(protected.chmod, 0o600)
+        missing = self.root / 'missing.pem'
+        self.env['SSL_CERT_FILE'] = str(missing)
+        for script in ('demudhra-linux.sh', 'demudhra-macos.sh'):
+            with self.subTest(script=script):
+                out = self.apply(script=script, expected=2)
+                self.assertIn('FAILED: Environment bundle does not exist: ' + str(missing), out)
+                self.assertIn('NEEDS ROOT: ' + str(protected), out)
+                self.assertIn('These targets need root:\n' + str(protected), out)
+                self.assertNotIn('re-run with sudo?', out)
+                self.assertNotIn('Run after reviewing these targets:', out)
+                self.assertEqual(protected.read_bytes(), certificate)
+
     def test_sudo_reexec_requires_confirmation_and_passes_yes(self):
         if os.geteuid() == 0:
             self.skipTest('needs nonroot permissions')
