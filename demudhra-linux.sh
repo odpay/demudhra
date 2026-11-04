@@ -3,7 +3,7 @@
 platform=linux
 # shellcheck shell=sh
 # shellcheck disable=SC2034,SC2154
-version=0.1.2
+version=0.1.3
 log() {
     case $* in
         FOUND*|Would\ remove*|WOULD\ REMOVE*)
@@ -985,6 +985,8 @@ inspect_java() {
         apply_java
         return
     fi
+    java_magic=$(od -An -tx1 -N4 "$java_store" 2>/dev/null | tr -d ' \n')
+    case $java_magic in feedfeed|cececece|30*) ;; *) return;; esac
     if ! command -v keytool >/dev/null 2>&1; then fail "Java keytool unavailable; cannot inspect $java_store"; immutable=$((immutable + 1)); return; fi
     if ! cp -p "$java_store" "$work/java-original"; then fail "Cannot snapshot Java store: $java_store"; return; fi
     if ! keytool -J-Duser.language=en -J-Duser.country=US -list -rfc -keystore "$work/java-original" -storepass changeit > "$work/java-list" 2> "$work/java.err"; then

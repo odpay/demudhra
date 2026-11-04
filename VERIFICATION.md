@@ -1,5 +1,15 @@
 # Verification
 
+## v0.1.3 (4 November 2026)
+
+No real-system removal ran. Same checks and tools as v0.1.2: every
+`tools/verify.py` suite under dash, sh and BusyBox 1.35.0 sh, ShellCheck 0.10.0
+at warning severity, and `tools/generate.py --check --verify-pems`. New
+regression: a GNOME-Keyring-style `user.keystore` produces no failure and exit 0,
+while a PKCS12 keystore in the same directory is still scanned and cleaned. The
+test fails against v0.1.2. The build carried v0.1.0, v0.1.1 and v0.1.2, each
+downloaded from `https://demudhra.sh/` and checked against its live `SHA256SUMS`.
+
 ## v0.1.2 (4 November 2026)
 
 No real-system removal ran. `tools/verify.py` passed every suite under dash, sh

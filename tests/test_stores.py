@@ -231,6 +231,24 @@ exit "$status"
                        "-keystore", store, "-storepass", "changeit"]).stdout
         self.assertEqual(fingerprint(pem), self.good_sha)
 
+    def test_non_java_keystore_named_file_is_not_a_failure(self):
+        keyring = self.root / "home/user/.local/share/keyrings/user.keystore"
+        keyring.parent.mkdir(parents=True)
+        keyring.write_bytes(b"GnomeKeyring\n\r\x00\n" + bytes(64))
+        before = keyring.read_bytes()
+        output = self.invoke("--dry-run", expected=0)
+        self.assertNotIn("FAILED", output)
+        self.assertIn("failed=0", output)
+        store = self.make_store("home/user/.local/share/keyrings/real.keystore", storetype="PKCS12")
+        output = self.invoke("--dry-run", "--verbose", expected=10)
+        self.assertNotIn("FAILED", output)
+        self.assertIn(str(store), output)
+        self.apply()
+        self.assertEqual(keyring.read_bytes(), before)
+        result = subprocess.run([KEYTOOL, "-list", "-keystore", str(store), "-storepass", "changeit",
+                                 "-alias", "target with spaces"], env=self.env, capture_output=True, timeout=45)
+        self.assertNotEqual(result.returncode, 0, "matching certificate remains in real keystore")
+
     def test_custom_java_password_reports_partial_failure(self):
         path = self.make_store("opt/custom-jdk/lib/security/cacerts", password="custom-secret")
         before = path.read_bytes()

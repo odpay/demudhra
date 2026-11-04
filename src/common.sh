@@ -1,6 +1,6 @@
 # shellcheck shell=sh
 # shellcheck disable=SC2034,SC2154
-version=0.1.2
+version=0.1.3
 log() {
     case $* in
         FOUND*|Would\ remove*|WOULD\ REMOVE*)

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.3] - 2026-11-04
+
+- Treat a file as a Java store only when its first bytes are a JKS, JCEKS or
+  PKCS12 header. Other files with Java-store names, such as a GNOME Keyring
+  `user.keystore`, are skipped instead of reported as a failure with exit 2.
+
 ## [0.1.2] - 2026-11-04
 
 - Remove DER files only when the decoded certificate exactly matches the entire file.
